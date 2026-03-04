@@ -1,16 +1,17 @@
 'use client';
 
 import { useState, useCallback } from 'react';
-import { Copy, Check } from 'lucide-react';
+import { Copy, Check, Download } from 'lucide-react';
 import { User } from '@skratch/shared';
 
 interface RoomHeaderProps {
     roomId: string;
     users: User[];
     connected: boolean;
+    onExport?: () => void;
 }
 
-export default function RoomHeader({ roomId, users, connected }: RoomHeaderProps) {
+export default function RoomHeader({ roomId, users, connected, onExport }: RoomHeaderProps) {
     const [copied, setCopied] = useState(false);
 
     const copyLink = useCallback(() => {
@@ -43,6 +44,17 @@ export default function RoomHeader({ roomId, users, connected }: RoomHeaderProps
             </div>
 
             <div className="room-header-right">
+                {onExport && (
+                    <button
+                        id="export-btn"
+                        className="copy-btn"
+                        onClick={onExport}
+                        title="Export as PNG"
+                        style={{ padding: '4px 8px' }}
+                    >
+                        <Download size={16} />
+                    </button>
+                )}
                 <div className="user-avatars">
                     {users.slice(0, 5).map((user) => (
                         <div

@@ -14,17 +14,36 @@ interface UseWhiteboardOptions {
 }
 
 export function useWhiteboard(options: UseWhiteboardOptions) {
-    const { canvasElId, ownerId, onObjectAdded, onObjectModified, onObjectRemoved } = options;
+    const { canvasElId, ownerId } = options;
 
     const canvasRef = useRef<fabric.Canvas | null>(null);
     const callbacksRef = useRef(options);
     callbacksRef.current = options;
 
-    const [activeTool, setActiveTool] = useState<DrawingTool>('freehand');
-    const [brushColor, setBrushColor] = useState('#FFFFFF');
-    const [brushSize, setBrushSize] = useState(3);
+    const [activeTool, setActiveToolState] = useState<DrawingTool>('freehand');
+    const activeToolRef = useRef<DrawingTool>('freehand');
+    const [brushColor, setBrushColorState] = useState('#FFFFFF');
+    const brushColorRef = useRef('#FFFFFF');
+    const [brushSize, setBrushSizeState] = useState(3);
+    const brushSizeRef = useRef(3);
     const [brushOpacity, setBrushOpacity] = useState(1);
     const [objectCount, setObjectCount] = useState(0);
+
+    // Wrapper setters that sync ref + state
+    const setActiveTool = useCallback((tool: DrawingTool) => {
+        activeToolRef.current = tool;
+        setActiveToolState(tool);
+    }, []);
+
+    const setBrushColor = useCallback((color: string) => {
+        brushColorRef.current = color;
+        setBrushColorState(color);
+    }, []);
+
+    const setBrushSize = useCallback((size: number) => {
+        brushSizeRef.current = size;
+        setBrushSizeState(size);
+    }, []);
 
     // Track if the event is from remote (skip emitting)
     const isRemoteRef = useRef(false);
@@ -42,13 +61,8 @@ export function useWhiteboard(options: UseWhiteboardOptions) {
         shape: null,
         objectId: '',
     });
-    // Panning state
-    const panRef = useRef<{
-        isPanning: boolean;
-        lastX: number;
-        lastY: number;
-        spaceDown: boolean;
-    }>({
+    // Panning
+    const panRef = useRef({
         isPanning: false,
         lastX: 0,
         lastY: 0,
@@ -77,9 +91,8 @@ export function useWhiteboard(options: UseWhiteboardOptions) {
 
         canvasRef.current = canvas;
 
-        // Handle window resize
+        // --- Resize ---
         const handleResize = () => {
-            if (!parent) return;
             canvas.setDimensions({
                 width: parent.clientWidth,
                 height: parent.clientHeight,
@@ -88,23 +101,20 @@ export function useWhiteboard(options: UseWhiteboardOptions) {
         };
         window.addEventListener('resize', handleResize);
 
-        // Handle zoom
-        const handleWheel = (opt: fabric.TEvent<WheelEvent>) => {
+        // --- Zoom ---
+        canvas.on('mouse:wheel', (opt: fabric.TEvent<WheelEvent>) => {
             const e = opt.e;
             e.preventDefault();
             e.stopPropagation();
-
             const delta = e.deltaY;
             let zoom = canvas.getZoom();
             zoom *= 0.999 ** delta;
             zoom = Math.max(DEFAULTS.ZOOM_MIN, Math.min(DEFAULTS.ZOOM_MAX, zoom));
-
             canvas.zoomToPoint(new fabric.Point(e.offsetX, e.offsetY), zoom);
             canvas.renderAll();
-        };
-        canvas.on('mouse:wheel', handleWheel);
+        });
 
-        // Handle keyboard for panning
+        // --- Keyboard: pan with space ---
         const handleKeyDown = (e: KeyboardEvent) => {
             if (e.code === 'Space' && !panRef.current.spaceDown) {
                 panRef.current.spaceDown = true;
@@ -119,28 +129,121 @@ export function useWhiteboard(options: UseWhiteboardOptions) {
             if (e.code === 'Space') {
                 panRef.current.spaceDown = false;
                 panRef.current.isPanning = false;
-                // Restore tool state
-                updateToolMode(canvas, activeTool);
+                updateToolMode(canvas, activeToolRef.current);
             }
         };
 
         document.addEventListener('keydown', handleKeyDown);
         document.addEventListener('keyup', handleKeyUp);
 
-        // Pan with mouse when space is held
+        // --- Mouse events: pan, shape drawing, eraser ---
         canvas.on('mouse:down', (opt) => {
+            const e = opt.e as MouseEvent;
+            const pointer = canvas.getScenePoint(e);
+
+            // Panning
             if (panRef.current.spaceDown) {
-                const e = opt.e as MouseEvent;
                 panRef.current.isPanning = true;
                 panRef.current.lastX = e.clientX;
                 panRef.current.lastY = e.clientY;
                 canvas.defaultCursor = 'grabbing';
+                return;
+            }
+
+            const tool = activeToolRef.current;
+
+            // Eraser: remove clicked object
+            if (tool === 'eraser') {
+                const target = canvas.findTarget(e);
+                if (target && (target as any).objectId) {
+                    const objId = (target as any).objectId;
+                    canvas.remove(target);
+                    canvas.renderAll();
+                    setObjectCount(canvas.getObjects().length);
+                    callbacksRef.current.onObjectRemoved?.(objId);
+                }
+                return;
+            }
+
+            // Text: place IText at click point
+            if (tool === 'text') {
+                const objId = uuidv4();
+                const text = new fabric.IText('Text', {
+                    left: pointer.x,
+                    top: pointer.y,
+                    fontSize: brushSizeRef.current * 5 + 10,
+                    fill: brushColorRef.current,
+                    fontFamily: 'system-ui, sans-serif',
+                });
+                (text as any).objectId = objId;
+                (text as any).ownerId = ownerId;
+                canvas.add(text);
+                canvas.setActiveObject(text);
+                text.enterEditing();
+                canvas.renderAll();
+                setObjectCount(canvas.getObjects().length);
+
+                // Emit after exiting editing
+                text.on('editing:exited', () => {
+                    const data = (text as any).toObject(['objectId', 'ownerId']);
+                    callbacksRef.current.onObjectAdded?.(objId, ownerId, data as Record<string, unknown>);
+                });
+                return;
+            }
+
+            // Shape tools: start drawing
+            if (['rectangle', 'circle', 'line'].includes(tool)) {
+                drawingRef.current.isDrawing = true;
+                drawingRef.current.startX = pointer.x;
+                drawingRef.current.startY = pointer.y;
+                drawingRef.current.objectId = uuidv4();
+
+                let shape: fabric.FabricObject | null = null;
+                const color = brushColorRef.current;
+                const strokeWidth = brushSizeRef.current;
+
+                if (tool === 'rectangle') {
+                    shape = new fabric.Rect({
+                        left: pointer.x,
+                        top: pointer.y,
+                        width: 0,
+                        height: 0,
+                        fill: 'transparent',
+                        stroke: color,
+                        strokeWidth,
+                    });
+                } else if (tool === 'circle') {
+                    shape = new fabric.Ellipse({
+                        left: pointer.x,
+                        top: pointer.y,
+                        rx: 0,
+                        ry: 0,
+                        fill: 'transparent',
+                        stroke: color,
+                        strokeWidth,
+                    });
+                } else if (tool === 'line') {
+                    shape = new fabric.Line([pointer.x, pointer.y, pointer.x, pointer.y], {
+                        stroke: color,
+                        strokeWidth,
+                    });
+                }
+
+                if (shape) {
+                    (shape as any).objectId = drawingRef.current.objectId;
+                    (shape as any).ownerId = ownerId;
+                    canvas.add(shape);
+                    drawingRef.current.shape = shape;
+                    canvas.renderAll();
+                }
             }
         });
 
         canvas.on('mouse:move', (opt) => {
+            const e = opt.e as MouseEvent;
+
+            // Panning
             if (panRef.current.isPanning) {
-                const e = opt.e as MouseEvent;
                 const vpt = canvas.viewportTransform;
                 if (!vpt) return;
                 vpt[4] += e.clientX - panRef.current.lastX;
@@ -148,17 +251,69 @@ export function useWhiteboard(options: UseWhiteboardOptions) {
                 panRef.current.lastX = e.clientX;
                 panRef.current.lastY = e.clientY;
                 canvas.requestRenderAll();
+                return;
             }
+
+            // Shape drawing
+            if (!drawingRef.current.isDrawing || !drawingRef.current.shape) return;
+
+            const pointer = canvas.getScenePoint(e);
+            const { startX, startY, shape } = drawingRef.current;
+            const tool = activeToolRef.current;
+
+            if (tool === 'rectangle') {
+                const rect = shape as fabric.Rect;
+                const w = pointer.x - startX;
+                const h = pointer.y - startY;
+                rect.set({
+                    left: w < 0 ? pointer.x : startX,
+                    top: h < 0 ? pointer.y : startY,
+                    width: Math.abs(w),
+                    height: Math.abs(h),
+                });
+            } else if (tool === 'circle') {
+                const ellipse = shape as fabric.Ellipse;
+                const rx = Math.abs(pointer.x - startX) / 2;
+                const ry = Math.abs(pointer.y - startY) / 2;
+                ellipse.set({
+                    left: Math.min(pointer.x, startX),
+                    top: Math.min(pointer.y, startY),
+                    rx,
+                    ry,
+                });
+            } else if (tool === 'line') {
+                const line = shape as fabric.Line;
+                line.set({ x2: pointer.x, y2: pointer.y });
+            }
+
+            canvas.renderAll();
         });
 
         canvas.on('mouse:up', () => {
+            // Pan end
             if (panRef.current.isPanning) {
                 panRef.current.isPanning = false;
                 canvas.defaultCursor = panRef.current.spaceDown ? 'grab' : 'default';
+                return;
+            }
+
+            // Shape end
+            if (drawingRef.current.isDrawing && drawingRef.current.shape) {
+                const shape = drawingRef.current.shape;
+                shape.setCoords();
+                canvas.renderAll();
+                setObjectCount(canvas.getObjects().length);
+
+                const objId = drawingRef.current.objectId;
+                const data = (shape as any).toObject(['objectId', 'ownerId']);
+                callbacksRef.current.onObjectAdded?.(objId, ownerId, data as Record<string, unknown>);
+
+                drawingRef.current.isDrawing = false;
+                drawingRef.current.shape = null;
             }
         });
 
-        // Listen for freehand path creation
+        // --- Freehand path creation ---
         canvas.on('path:created', (opt: { path: fabric.Path }) => {
             if (isRemoteRef.current) return;
             const path = opt.path;
@@ -170,7 +325,7 @@ export function useWhiteboard(options: UseWhiteboardOptions) {
             callbacksRef.current.onObjectAdded?.(objId, ownerId, data as Record<string, unknown>);
         });
 
-        // Listen for object modifications (move, resize)
+        // --- Object modifications (move, resize) ---
         canvas.on('object:modified', (opt) => {
             if (isRemoteRef.current) return;
             const obj = opt.target;
@@ -195,8 +350,6 @@ export function useWhiteboard(options: UseWhiteboardOptions) {
         if (!canvas || !canvas.freeDrawingBrush) return;
         canvas.freeDrawingBrush.color = brushColor;
         canvas.freeDrawingBrush.width = brushSize;
-        // fabric.js PencilBrush doesn't have opacity on brush directly
-        // We handle opacity via globalCompositeOperation or stroke opacity
     }, [brushColor, brushSize, brushOpacity]);
 
     // Update tool mode when activeTool changes
@@ -299,6 +452,13 @@ export function useWhiteboard(options: UseWhiteboardOptions) {
 
     const getCanvasElement = useCallback(() => canvasRef.current, []);
 
+    // Export canvas to PNG data URL
+    const exportToPNG = useCallback((): string | null => {
+        const canvas = canvasRef.current;
+        if (!canvas) return null;
+        return canvas.toDataURL({ format: 'png', quality: 1, multiplier: 2 } as any);
+    }, []);
+
     return {
         canvas: canvasRef,
         activeTool,
@@ -317,6 +477,7 @@ export function useWhiteboard(options: UseWhiteboardOptions) {
         clearCanvas,
         removeObjectById,
         getCanvasElement,
+        exportToPNG,
     };
 }
 
@@ -337,7 +498,7 @@ function updateToolMode(canvas: fabric.Canvas, tool: DrawingTool) {
         case 'eraser':
             canvas.isDrawingMode = false;
             canvas.selection = false;
-            canvas.defaultCursor = 'not-allowed';
+            canvas.defaultCursor = 'crosshair';
             break;
         case 'rectangle':
         case 'circle':

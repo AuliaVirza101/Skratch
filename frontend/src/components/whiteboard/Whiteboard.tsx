@@ -3,6 +3,7 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { useSocket } from '@/hooks/useSocket';
 import { useWhiteboard } from '@/hooks/useWhiteboard';
+import { useUndoRedo, type UndoAction } from '@/hooks/useUndoRedo';
 import Toolbar from './Toolbar';
 import BrushControls from './BrushControls';
 import CursorOverlay, { type CursorData } from './CursorOverlay';
@@ -17,8 +18,10 @@ export default function Whiteboard({ roomId }: WhiteboardProps) {
     const cursorsRef = useRef<Map<string, CursorData>>(new Map());
     const [cursorVersion, setCursorVersion] = useState(0);
     const throttleRef = useRef<number>(0);
-    const [showBrush, setShowBrush] = useState(true);
     const [confirmClear, setConfirmClear] = useState(false);
+
+    // Undo/Redo hook
+    const undoRedo = useUndoRedo();
 
     // Whiteboard hook — pure canvas logic
     const wb = useWhiteboard({
@@ -26,12 +29,14 @@ export default function Whiteboard({ roomId }: WhiteboardProps) {
         ownerId: '', // Will be set once socket connects
         onObjectAdded: (objectId, ownerId, data) => {
             socketHook.emitDrawEnd({ objectId, ownerId, data });
+            undoRedo.pushAction({ type: 'add', objectId, data: data as Record<string, unknown> });
         },
         onObjectModified: (objectId, data) => {
             socketHook.emitDrawUpdate({ objectId, data });
         },
         onObjectRemoved: (objectId) => {
             socketHook.emitDrawDelete({ objectId });
+            undoRedo.pushAction({ type: 'remove', objectId });
         },
     });
 
@@ -62,15 +67,64 @@ export default function Whiteboard({ roomId }: WhiteboardProps) {
         },
         onCanvasClear: () => {
             wb.clearCanvas();
+            undoRedo.clear();
         },
     });
 
-    // Handle keyboard shortcuts for tool selection
+    // Handle keyboard shortcuts for tool selection + undo/redo
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
             // Ignore if user is typing in an input
             if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
 
+            // Undo: Ctrl+Z
+            if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+                e.preventDefault();
+                const action = undoRedo.undo();
+                if (action) {
+                    if (action.type === 'add') {
+                        // Undo an add = remove the object
+                        wb.removeRemoteObject(action.objectId);
+                        socketHook.emitDrawDelete({ objectId: action.objectId });
+                    } else if (action.type === 'remove' && action.data) {
+                        // Undo a remove = re-add the object
+                        wb.addRemoteObject(action.data);
+                        socketHook.emitDrawEnd({
+                            objectId: action.objectId,
+                            ownerId: (action.data as any).ownerId || '',
+                            data: action.data,
+                        });
+                    }
+                }
+                return;
+            }
+
+            // Redo: Ctrl+Y or Ctrl+Shift+Z
+            if (
+                ((e.ctrlKey || e.metaKey) && e.key === 'y') ||
+                ((e.ctrlKey || e.metaKey) && e.key === 'z' && e.shiftKey)
+            ) {
+                e.preventDefault();
+                const action = undoRedo.redo();
+                if (action) {
+                    if (action.type === 'add' && action.data) {
+                        // Redo an add = re-add the object
+                        wb.addRemoteObject(action.data);
+                        socketHook.emitDrawEnd({
+                            objectId: action.objectId,
+                            ownerId: (action.data as any).ownerId || '',
+                            data: action.data,
+                        });
+                    } else if (action.type === 'remove') {
+                        // Redo a remove = remove again
+                        wb.removeRemoteObject(action.objectId);
+                        socketHook.emitDrawDelete({ objectId: action.objectId });
+                    }
+                }
+                return;
+            }
+
+            // Tool shortcuts
             const tool = SHORTCUTS[e.key.toLowerCase()];
             if (tool) {
                 wb.setActiveTool(tool as DrawingTool);
@@ -78,7 +132,7 @@ export default function Whiteboard({ roomId }: WhiteboardProps) {
         };
         document.addEventListener('keydown', handleKeyDown);
         return () => document.removeEventListener('keydown', handleKeyDown);
-    }, [wb]);
+    }, [wb, undoRedo, socketHook]);
 
     // Throttled cursor emit
     const handleMouseMove = useCallback(
@@ -104,8 +158,19 @@ export default function Whiteboard({ roomId }: WhiteboardProps) {
         }
         wb.clearCanvas();
         socketHook.emitCanvasClear();
+        undoRedo.clear();
         setConfirmClear(false);
-    }, [confirmClear, wb, socketHook]);
+    }, [confirmClear, wb, socketHook, undoRedo]);
+
+    // Export to PNG
+    const handleExport = useCallback(() => {
+        const dataUrl = wb.exportToPNG();
+        if (!dataUrl) return;
+        const link = document.createElement('a');
+        link.download = `skratch-${roomId}.png`;
+        link.href = dataUrl;
+        link.click();
+    }, [wb, roomId]);
 
     // Toggle brush controls visibility
     const toolsWithBrush: DrawingTool[] = ['freehand', 'rectangle', 'circle', 'line', 'text'];
@@ -137,6 +202,7 @@ export default function Whiteboard({ roomId }: WhiteboardProps) {
                 roomId={roomId}
                 users={socketHook.users}
                 connected={socketHook.connected}
+                onExport={handleExport}
             />
 
             <Toolbar
